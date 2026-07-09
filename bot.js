@@ -17,14 +17,17 @@ const net        = require('net');
 const MAX_BOTS = 5;
 
 // ── Shared server config ──────────────────────────────────────────────────────
-// NOTE: webhookUrl was previously hardcoded here and is a credential — it now
-// defaults to empty. Re-enter it in the dashboard's Webhook panel and save.
+// Defaults can come from environment variables so they survive restarts/redeploys
+// (Railway wipes in-memory state on every restart). Set these in your Railway
+// service's Variables tab: MC_HOST, MC_PORT, MC_VERSION, WEBHOOK_URL.
+// Whatever you save from the dashboard overrides these at runtime, but a restart
+// falls back to the env vars again instead of going blank.
 
 const config = {
-  host:       'man.serveminecraft.net',
-  port:       25565,
-  webhookUrl: '',
-  version:    'auto'
+  host:       process.env.MC_HOST    || 'man.serveminecraft.net',
+  port:       Number(process.env.MC_PORT) || 25565,
+  webhookUrl: process.env.WEBHOOK_URL || '',
+  version:    process.env.MC_VERSION  || 'auto'
 };
 
 // ── Bot profiles (identities that can connect to the server) ─────────────────
