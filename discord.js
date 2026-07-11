@@ -21,6 +21,29 @@
 
 const { Client, GatewayIntentBits, EmbedBuilder } = require('discord.js');
 const botManager = require('./bot');
+const fs   = require('fs');
+const path = require('path');
+
+// ── Persistence (mirrors bot.js — same data/ folder, own small file) ────────
+
+const DATA_DIR   = path.join(__dirname, 'data');
+const STATE_FILE = path.join(DATA_DIR, 'discord-state.json');
+
+function loadDiscordState() {
+  try {
+    if (!fs.existsSync(STATE_FILE)) return null;
+    return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+  } catch { return null; }
+}
+
+function saveDiscordState() {
+  try {
+    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(STATE_FILE, JSON.stringify(dcState, null, 2));
+  } catch (e) {
+    console.error(`[DISCORD] Failed to save state: ${e.message}`);
+  }
+}
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
@@ -29,10 +52,13 @@ let loginTimeout = null;
 let retryCount   = 0;
 const MAX_RETRIES = 5;
 
+const discordSaved = loadDiscordState();
+
 const dcState = {
-  token:     process.env.DISCORD_BOT_TOKEN  || '',
-  channelId: process.env.DISCORD_CHANNEL_ID || '',
-  roleId:    process.env.DISCORD_ROLE_ID    || ''
+  token:       discordSaved?.token       || process.env.DISCORD_BOT_TOKEN  || '',
+  channelId:   discordSaved?.channelId   || process.env.DISCORD_CHANNEL_ID || '',
+  roleId:      discordSaved?.roleId      || process.env.DISCORD_ROLE_ID    || '',
+  wasRunning:  discordSaved?.wasRunning  || false
 };
 
 const UNSAFE_START = /^[\\/\\.]+/;
@@ -70,17 +96,19 @@ function handleStatus(msg) {
   const players   = botManager.getOnlinePlayers();
   const online    = overall === 'connected';
   const playerCnt = players ? players.length : 0;
-  const primary   = bots.find(b => b.isPrimary);
+  const relay     = bots.find(b => b.isRelay);
+  const speaker   = bots.find(b => b.isSpeaker);
 
   const embed = new EmbedBuilder()
     .setTitle('🎮 MC Server Status')
     .setColor(online ? 0x2ecc71 : 0xe74c3c)
     .addFields(
-      { name: 'Server',    value: botManager.config.host || 'Not set', inline: true },
-      { name: 'Status',    value: online ? '🟢 Online' : '🔴 Offline', inline: true },
-      { name: 'Players',   value: online ? String(playerCnt) : '—', inline: true },
-      { name: 'Bots',      value: `${connected}/${bots.length} connected`, inline: true },
-      { name: 'Relay bot', value: primary ? `${primary.name} (${primary.status})` : 'None set', inline: true }
+      { name: 'Server',      value: botManager.config.host || 'Not set', inline: true },
+      { name: 'Status',      value: online ? '🟢 Online' : '🔴 Offline', inline: true },
+      { name: 'Players',     value: online ? String(playerCnt) : '—', inline: true },
+      { name: 'Bots',        value: `${connected}/${bots.length} connected`, inline: true },
+      { name: '📡 Relay bot',  value: relay   ? `${relay.name} (${relay.status})`   : 'None set', inline: true },
+      { name: '🗣 Speaker bot', value: speaker ? `${speaker.name} (${speaker.status})` : 'None set', inline: true }
     )
     .setTimestamp();
 
@@ -94,7 +122,7 @@ function handlePlayers(msg) {
   const overall  = botManager.getOverallStatus();
 
   if (overall !== 'connected') {
-    return msg.reply('❌ No relay bot is connected.').catch(e => {
+    return msg.reply('❌ No bot is connected.').catch(e => {
       console.error(`[DISCORD] Failed to send reply: ${e.message}`);
     });
   }
@@ -144,9 +172,11 @@ function startDiscordBot(token, channelId, roleId) {
   cleanupClient();
   retryCount = 0;
 
-  dcState.token     = token;
-  dcState.channelId = channelId;
-  dcState.roleId    = roleId || '';
+  dcState.token      = token;
+  dcState.channelId  = channelId;
+  dcState.roleId     = roleId || '';
+  dcState.wasRunning = true;
+  saveDiscordState();
 
   attemptLogin();
 }
@@ -324,12 +354,23 @@ function handleRetry() {
 function stopDiscordBot() {
   cleanupClient();
   retryCount = 0;
+  dcState.wasRunning = false;
+  saveDiscordState();
   console.log('[DISCORD] Bot stopped');
 }
 
 function getDiscordStatus() {
   if (!client) return 'offline';
   return client.isReady() ? 'online' : 'connecting';
+}
+
+// ── Boot: resume the Discord connection if it was running before a restart ──
+
+if (dcState.wasRunning && dcState.token && dcState.channelId) {
+  setTimeout(() => {
+    console.log('[DISCORD] Resuming connection from before restart…');
+    attemptLogin();
+  }, 3000);
 }
 
 // ── Exports ───────────────────────────────────────────────────────────────────
