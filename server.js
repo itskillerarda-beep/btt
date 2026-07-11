@@ -5,6 +5,20 @@ const path       = require('path');
 const botManager = require('./bot');
 const discord    = require('./discord');
 
+// ── Crash guards ──────────────────────────────────────────────────────────────
+// A single uncaught error anywhere (a stray socket event, a bad packet, etc.)
+// would otherwise kill the whole Node process — wiping every bot profile and
+// setting from memory and requiring a full manual reconfigure. Log and keep
+// running instead; individual bot connections already handle their own
+// errors and will auto-reconnect via the auto-join scheduler.
+
+process.on('uncaughtException', err => {
+  console.error('[FATAL] Uncaught exception (process kept alive):', err);
+});
+process.on('unhandledRejection', err => {
+  console.error('[FATAL] Unhandled rejection (process kept alive):', err);
+});
+
 const app  = express();
 const PORT = process.env.PORT || 9956;
 
@@ -34,9 +48,10 @@ app.get('/api/status', (req, res) => {
       useDisplayName: botManager.getUseDisplayName(),
       aliases:        botManager.getNameAliases()
     },
-    automations: botManager.getAutomations(),
-    autoJoin:    botManager.getAutoJoin(),
-    ping:        botManager.getLastPing()
+    automations:    botManager.getAutomations(),
+    blockedPhrases: botManager.getBlockedPhrases(),
+    autoJoin:       botManager.getAutoJoin(),
+    ping:           botManager.getLastPing()
   });
 });
 
@@ -65,16 +80,11 @@ app.get('/api/ping', async (req, res) => {
 app.post('/api/server-config', (req, res) => {
   const { host, port, webhookUrl, version } = req.body;
   if (!host) return res.status(400).json({ error: 'host required' });
-
-  botManager.config.host       = host.trim();
-  botManager.config.port       = Number(port) || 25565;
-  botManager.config.webhookUrl = webhookUrl || '';
-  botManager.config.version    = version || 'auto';
-
+  botManager.setServerConfig({ host, port, webhookUrl, version });
   res.json({ ok: true });
 });
 
-// ── Bot profiles (create/remove/connect/disconnect/select relay bot) ────────
+// ── Bot profiles (create/remove/connect/disconnect/select roles) ────────────
 
 app.post('/api/bots', (req, res) => {
   const { name, username } = req.body;
@@ -106,9 +116,18 @@ app.post('/api/bots/:id/disconnect', (req, res) => {
   res.json({ ok: true });
 });
 
-app.post('/api/bots/:id/primary', (req, res) => {
+app.post('/api/bots/:id/relay', (req, res) => {
   try {
-    botManager.setPrimary(req.params.id);
+    botManager.setRelay(req.params.id);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+app.post('/api/bots/:id/speaker', (req, res) => {
+  try {
+    botManager.setSpeaker(req.params.id);
     res.json({ ok: true });
   } catch (e) {
     res.status(400).json({ error: e.message });
