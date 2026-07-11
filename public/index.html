@@ -165,11 +165,16 @@ select option { background: #111; }
 .bot-dot.connected  { background: var(--green); box-shadow: 0 0 6px var(--green); }
 .bot-dot.connecting { background: var(--yellow); }
 .bot-name { font-size: .82rem; color: var(--text); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.bot-star { cursor: pointer; font-size: .85rem; color: var(--muted); flex-shrink: 0; }
-.bot-star.active { color: var(--yellow); text-shadow: 0 0 6px var(--yellow); }
+.bot-role { cursor: pointer; font-size: .82rem; color: var(--muted); flex-shrink: 0; opacity: .4; transition: opacity .15s, color .15s; }
+.bot-role:hover { opacity: .8; }
+.bot-role.active { opacity: 1; }
+.bot-role.relay.active   { color: var(--green); text-shadow: 0 0 6px var(--green); }
+.bot-role.speaker.active { color: var(--yellow); text-shadow: 0 0 6px var(--yellow); }
 .bot-del { cursor: pointer; font-size: .8rem; color: var(--red); flex-shrink: 0; }
 .bot-del:hover { color: #fff; }
-.bot-user { font-size: .68rem; color: var(--muted); margin: 3px 0 6px; }
+.bot-user { font-size: .68rem; color: var(--muted); margin: 3px 0 2px; }
+.bot-roles-label { font-size: .62rem; color: var(--muted); margin-bottom: 6px; }
+.bot-roles-label b { color: var(--text); }
 .bot-card-actions { display: flex; gap: 6px; }
 .bot-card-actions button {
   flex: 1; font-family: 'Share Tech Mono', monospace; font-size: .68rem;
@@ -416,7 +421,7 @@ select option { background: #111; }
     <!-- Bot Accounts -->
     <div class="panel">
       <div class="panel-title">🤖 BOT ACCOUNTS <span class="bots-count" id="bots-count">(0/5)</span></div>
-      <div class="hint">Create up to 5 bot identities that join the same server. Connect however many you want. The <span style="color:var(--yellow)">★</span> bot is the <b>relay bot</b> — it's the only one that forwards chat to Discord and receives /say commands.</div>
+      <div class="hint">Create up to 5 bot identities that join the same server. Connect however many you want. Tap <span style="color:var(--green)">📡</span> to set the <b>relay bot</b> (MC chat → Discord, runs automations) and <span style="color:var(--yellow)">🗣</span> to set the <b>speaker bot</b> (Discord /say, t! → MC chat). Same bot can do both, or split them across two bots.</div>
       <div class="bots-list" id="bots-list"></div>
       <div class="add-bot-row">
         <input id="new-bot-name" type="text" placeholder="Label (e.g. AFK 2)" />
@@ -573,9 +578,9 @@ select option { background: #111; }
 <script>
 // ── State ─────────────────────────────────────────────────────────────────────
 let lastLogCount   = 0;
-let blockedPhrases = JSON.parse(localStorage.getItem('blockedPhrases') || '[]');
-let nameAliases    = JSON.parse(localStorage.getItem('nameAliases')    || '{}');
-let automations    = JSON.parse(localStorage.getItem('automations')    || '[]');
+let blockedPhrases = [];
+let nameAliases    = {};
+let automations    = [];
 let ctxTargetText  = '';
 let pingInterval   = null;
 
@@ -656,7 +661,6 @@ function addPhrase() {
 }
 function removePhrase(i) { blockedPhrases.splice(i,1); renderTags(); }
 async function saveBlocked() {
-  localStorage.setItem('blockedPhrases', JSON.stringify(blockedPhrases));
   await api('/api/blocked', { phrases: blockedPhrases });
   showToast('Filters saved!');
 }
@@ -687,8 +691,6 @@ function addAlias() {
 function removeAlias(key) { delete nameAliases[key]; renderAliases(); }
 async function saveNameSettings() {
   const useDisplayName = document.getElementById('displayname-toggle').checked;
-  localStorage.setItem('nameAliases', JSON.stringify(nameAliases));
-  localStorage.setItem('useDisplayName', String(useDisplayName));
   document.getElementById('name-key-hint').innerHTML =
     `Currently matching by: <b>${useDisplayName ? 'display name' : 'username'}</b>`;
   await api('/api/names', { aliases: nameAliases, useDisplayName });
@@ -726,7 +728,6 @@ function addAutomation() {
 }
 function removeAutomation(i) { automations.splice(i,1); renderAutomations(); }
 async function saveAutomations() {
-  localStorage.setItem('automations', JSON.stringify(automations));
   await api('/api/automations', { automations });
   showToast(`${automations.length} automation(s) saved!`);
 }
@@ -885,15 +886,18 @@ function renderBots(bots, maxBots) {
     const connecting = b.status === 'connecting';
     const dotClass   = connected ? 'connected' : connecting ? 'connecting' : '';
     const statusText = connected ? 'Connected' : connecting ? 'Connecting…' : 'Offline';
+    const roles = [b.isRelay ? 'Relay' : null, b.isSpeaker ? 'Speaker' : null].filter(Boolean);
     return `
-      <div class="bot-card${b.isPrimary ? ' is-primary' : ''}">
+      <div class="bot-card${b.isRelay || b.isSpeaker ? ' is-primary' : ''}">
         <div class="bot-card-top">
           <span class="bot-dot ${dotClass}"></span>
           <span class="bot-name" title="${esc(b.name)}">${esc(b.name)}</span>
-          <span class="bot-star${b.isPrimary ? ' active' : ''}" title="Set as relay bot" onclick="setPrimaryRow('${b.id}')">★</span>
+          <span class="bot-role relay${b.isRelay ? ' active' : ''}" title="Set as relay bot (MC → Discord)" onclick="setRelayRow('${b.id}')">📡</span>
+          <span class="bot-role speaker${b.isSpeaker ? ' active' : ''}" title="Set as speaker bot (Discord → MC)" onclick="setSpeakerRow('${b.id}')">🗣</span>
           <span class="bot-del" title="Remove bot" onclick="removeBotProfile('${b.id}','${esc(b.name).replace(/'/g, "\\'")}')">🗑</span>
         </div>
         <div class="bot-user">${esc(b.username)} — ${statusText}</div>
+        <div class="bot-roles-label">${roles.length ? '<b>' + roles.join(' + ') + '</b>' : 'AFK only'}</div>
         <div class="bot-card-actions">
           <button class="bot-btn-connect" ${connected || connecting ? 'disabled' : ''} onclick="connectBotRow('${b.id}')">▶ CONNECT</button>
           <button class="bot-btn-disconnect" ${!connected && !connecting ? 'disabled' : ''} onclick="disconnectBotRow('${b.id}')">■ STOP</button>
@@ -936,9 +940,15 @@ async function disconnectBotRow(id) {
   fetchStatus();
 }
 
-async function setPrimaryRow(id) {
-  const d = await api('/api/bots/' + id + '/primary', {});
+async function setRelayRow(id) {
+  const d = await api('/api/bots/' + id + '/relay', {});
   showToast(d.ok ? 'Relay bot updated!' : (d.error || 'Error'), !d.ok);
+  fetchStatus();
+}
+
+async function setSpeakerRow(id) {
+  const d = await api('/api/bots/' + id + '/speaker', {});
+  showToast(d.ok ? 'Speaker bot updated!' : (d.error || 'Error'), !d.ok);
   fetchStatus();
 }
 
@@ -988,33 +998,19 @@ async function dcStop() {
     document.getElementById('name-key-hint').innerHTML    =
       `Currently matching by: <b>${d.nameSettings?.useDisplayName ? 'display name' : 'username'}</b>`;
 
-    if (d.nameSettings?.aliases)   nameAliases = d.nameSettings.aliases;
-    if (d.automations?.length)     automations = d.automations;
-    if (d.ping?.checkedAt)         updatePingUI(d.ping);
+    nameAliases    = d.nameSettings?.aliases || {};
+    automations    = d.automations           || [];
+    blockedPhrases = d.blockedPhrases         || [];
+
+    if (d.ping?.checkedAt) updatePingUI(d.ping);
 
     lastBotsJson = JSON.stringify(d.bots);
     renderBots(d.bots || [], d.maxBots || 5);
   } catch {}
 
-  // Fallback: restore from localStorage
-  const savedAliases = localStorage.getItem('nameAliases');
-  if (savedAliases && !Object.keys(nameAliases).length) nameAliases = JSON.parse(savedAliases);
-  const savedDN = localStorage.getItem('useDisplayName');
-  if (savedDN !== null) document.getElementById('displayname-toggle').checked = savedDN === 'true';
-  const savedAutos = localStorage.getItem('automations');
-  if (savedAutos && !automations.length) automations = JSON.parse(savedAutos);
-
   renderTags();
   renderAliases();
   renderAutomations();
-
-  // Push saved settings to server on load
-  if (blockedPhrases.length) api('/api/blocked', { phrases: blockedPhrases });
-  if (automations.length)    api('/api/automations', { automations });
-  api('/api/names', {
-    aliases:        nameAliases,
-    useDisplayName: document.getElementById('displayname-toggle').checked
-  });
 
   // Initial ping on load
   manualPing();
@@ -1022,8 +1018,7 @@ async function dcStop() {
   // Polling
   setInterval(fetchStatus, 2000);
   setInterval(fetchLogs,   1500);
-  // Ping server every 30s automatically
-  setInterval(manualPing, 30000);
+  setInterval(manualPing, 30000); // ping server every 30s automatically
 
   fetchStatus();
   fetchLogs();
