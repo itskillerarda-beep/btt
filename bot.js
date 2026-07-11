@@ -3,62 +3,114 @@
  * bot.js — Mineflayer MC relay core (multi-bot)
  *
  * Supports up to MAX_BOTS separate bot profiles (name + username) all
- * connecting to the same configured server. Only the "primary" (relay) bot
- * forwards chat/join-leave/system messages to the Discord webhook, runs chat
- * automations, and sends messages typed via the dashboard or Discord — this
- * avoids duplicate webhook posts when several bots are online at once.
- * The other bots just stay connected (AFK).
+ * connecting to the same configured server. Two independent roles:
+ *
+ *   • Relay bot (relayId)     — forwards MC chat/join-leave/system messages
+ *                               to the Discord webhook, runs automations.
+ *   • Speaker bot (speakerId) — sends messages typed via the dashboard or
+ *                               Discord (/say, t!) into MC chat.
+ *
+ * These can point at the same bot or two different bots. Any other bots are
+ * just AFK — connected, but silent.
+ *
+ * State (server config, bot profiles, role assignments, relay settings, and
+ * which bots should be connected) is persisted to disk so a process restart
+ * (crash, redeploy, host restart) automatically restores everything and
+ * reconnects the bots that were online — instead of coming back empty.
  */
 
 const mineflayer = require('mineflayer');
 const axios      = require('axios');
 const net        = require('net');
+const fs         = require('fs');
+const path       = require('path');
 
 const MAX_BOTS = 5;
 
-// ── Shared server config ──────────────────────────────────────────────────────
-// Defaults can come from environment variables so they survive restarts/redeploys
-// (Railway wipes in-memory state on every restart). Set these in your Railway
-// service's Variables tab: MC_HOST, MC_PORT, MC_VERSION, WEBHOOK_URL.
-// Whatever you save from the dashboard overrides these at runtime, but a restart
-// falls back to the env vars again instead of going blank.
+// ── Persistence ────────────────────────────────────────────────────────────
+// Note: on hosts with an ephemeral filesystem (no attached volume), this file
+// survives in-process restarts/crashes but not a full container rebuild. If
+// your host supports a persistent volume, mount it over the `data/` folder.
 
-const config = {
-  host:       process.env.MC_HOST    || 'man.serveminecraft.net',
+const DATA_DIR    = path.join(__dirname, 'data');
+const STATE_FILE  = path.join(DATA_DIR, 'state.json');
+
+function loadState() {
+  try {
+    if (!fs.existsSync(STATE_FILE)) return null;
+    return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+  } catch (e) {
+    console.error(`[STATE] Failed to load ${STATE_FILE}: ${e.message}`);
+    return null;
+  }
+}
+
+let saveScheduled = false;
+function saveState() {
+  // Debounce: multiple mutations in the same tick collapse into one write.
+  if (saveScheduled) return;
+  saveScheduled = true;
+  setImmediate(() => {
+    saveScheduled = false;
+    try {
+      if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+      const snapshot = {
+        config, profiles, relayId, speakerId,
+        autoJoin, blockedPhrases, nameAliases, useDisplayName, automations,
+        // ids of bots that should auto-reconnect on boot / after a crash
+        wantConnected: profiles.filter(p => !ensureState(p.id).manualStop).map(p => p.id)
+      };
+      fs.writeFileSync(STATE_FILE, JSON.stringify(snapshot, null, 2));
+    } catch (e) {
+      console.error(`[STATE] Failed to save: ${e.message}`);
+    }
+  });
+}
+
+const saved = loadState();
+
+// ── Shared server config ──────────────────────────────────────────────────────
+// Defaults fall back to env vars (MC_HOST, MC_PORT, MC_VERSION, WEBHOOK_URL) if
+// nothing was ever saved to disk yet.
+
+const config = Object.assign({
+  host:       process.env.MC_HOST     || 'man.serveminecraft.net',
   port:       Number(process.env.MC_PORT) || 25565,
   webhookUrl: process.env.WEBHOOK_URL || '',
   version:    process.env.MC_VERSION  || 'auto'
-};
+}, saved?.config || {});
 
 // ── Bot profiles (identities that can connect to the server) ─────────────────
 
-const profiles = [
-  { id: 'bot1', name: 'Bot 1', username: 'ShadowZ2' }
-];
-let primaryId = 'bot1'; // the relay bot — forwards chat, runs automations, sends outgoing chat
+let profiles = (Array.isArray(saved?.profiles) && saved.profiles.length)
+  ? saved.profiles
+  : [{ id: 'bot1', name: 'Bot 1', username: 'ShadowZ2' }];
 
-// Runtime state per bot id
+let relayId   = saved?.relayId   ?? profiles[0]?.id ?? null;
+let speakerId = saved?.speakerId ?? profiles[0]?.id ?? null;
+
+// Runtime state per bot id (never persisted directly — rebuilt on boot)
 const instances = new Map();
 function ensureState(id) {
   if (!instances.has(id)) {
     instances.set(id, {
       bot: null, status: 'disconnected', manualStop: true,
-      autoJoinTimer: null, packetCount: 0
+      autoJoinTimer: null, packetCount: 0, failCount: 0
     });
   }
   return instances.get(id);
 }
-ensureState('bot1');
+for (const p of profiles) ensureState(p.id);
 
 function findProfile(id) { return profiles.find(p => p.id === id); }
 
 // ── Global relay settings ─────────────────────────────────────────────────────
 
-let autoJoin       = false;
-let blockedPhrases = [];
-let nameAliases    = {};
-let useDisplayName = false;
-let automations    = [];
+let autoJoin       = saved?.autoJoin ?? false;
+let blockedPhrases = Array.isArray(saved?.blockedPhrases) ? saved.blockedPhrases : [];
+let nameAliases    = (saved?.nameAliases && typeof saved.nameAliases === 'object') ? saved.nameAliases : {};
+let useDisplayName = !!saved?.useDisplayName;
+let automations    = Array.isArray(saved?.automations) ? saved.automations : [];
 const logs         = [];
 
 let lastPing = {
@@ -84,7 +136,7 @@ function clearLogs() {
 // ── Webhook queue (shared — single flush loop for all bots) ──────────────────
 //
 // Design goals:
-//   • Exactly ONE flush loop running at all times (flushLoop flag)
+//   • Exactly ONE flush loop running at all times (flushRunning flag)
 //   • Messages sent one-by-one with MIN_GAP_MS spacing between them
 //   • On 429: pause the whole loop for retry_after + small buffer
 //   • On permanent 4xx: drop the message, move on
@@ -229,7 +281,9 @@ function teamColor(team) {
   return Math.abs(hash) % 0xFFFFFF;
 }
 
-// ── Chat automations (only ever run by the primary/relay bot) ────────────────
+// ── Chat automations (run independently on every connected bot — e.g. so a ──
+// private "/login <password>" prompt gets answered by whichever bot actually
+// received it, not just the relay bot) ────────────────────────────────────────
 
 function runAutomations(text, id) {
   const st = instances.get(id);
@@ -256,7 +310,7 @@ function runAutomations(text, id) {
   }
 }
 
-// ── Webhook senders (only invoked for the primary/relay bot's events) ────────
+// ── Webhook senders (only invoked for the relay bot's events) ────────────────
 
 function sendChatMessage(mcUsername, chatText, team) {
   if (isBlocked(chatText)) { log(`[BLOCKED] ${chatText}`, 'warn'); return; }
@@ -365,8 +419,8 @@ function pingServer(host, port) {
     };
 
     socket.setTimeout(10000);
-    socket.once('timeout', () => { log(`Ping timeout for ${host}:${port}`, 'warn'); finish({ online: false }); });
-    socket.once('error',   err => { log(`Ping error for ${host}:${port} — ${err.message}`, 'warn'); finish({ online: false }); });
+    socket.once('timeout', () => { finish({ online: false }); });
+    socket.once('error',   () => { finish({ online: false }); });
 
     socket.once('connect', () => {
       try {
@@ -383,7 +437,7 @@ function pingServer(host, port) {
           encodePacket(Buffer.from(hsData)),
           encodePacket(Buffer.from([0x00]))
         ]));
-      } catch (e) { log(`Ping build error — ${e.message}`, 'warn'); finish({ online: false }); }
+      } catch (e) { finish({ online: false }); }
     });
 
     socket.on('data', chunk => {
@@ -394,7 +448,7 @@ function pingServer(host, port) {
         const [pktLen, after1] = readVarInt(rxBuf, off); off = after1;
         if (rxBuf.length < off + pktLen) return;
         const [pktId, after2]   = readVarInt(rxBuf, off);
-        if (pktId !== 0x00) { log(`Ping unexpected packet ID 0x${pktId.toString(16)}`, 'warn'); return finish({ online: false }); }
+        if (pktId !== 0x00) return finish({ online: false });
         const [jsonLen, after3] = readVarInt(rxBuf, after2);
         if (rxBuf.length < after3 + jsonLen) return;
         const json = JSON.parse(rxBuf.slice(after3, after3 + jsonLen).toString('utf8'));
@@ -410,7 +464,7 @@ function pingServer(host, port) {
           checkedAt:   new Date().toISOString()
         });
       } catch (e) {
-        if (e.message !== 'VarInt incomplete') { log(`Ping parse error — ${e.message}`, 'warn'); finish({ online: false }); }
+        if (e.message !== 'VarInt incomplete') finish({ online: false });
       }
     });
 
@@ -421,41 +475,13 @@ function pingServer(host, port) {
 // ── Protocol → mineflayer version string map ──────────────────────────────────
 
 const PROTOCOL_TO_VERSION = {
-  769: '1.21.4',
-  768: '1.21.2',
-  767: '1.21',
-  766: '1.20.6',
-  765: '1.20.4',
-  764: '1.20.2',
-  763: '1.20.1',
-  762: '1.19.4',
-  761: '1.19.3',
-  760: '1.19.2',
-  759: '1.19',
-  758: '1.18.2',
-  757: '1.18.1',
-  756: '1.17.1',
-  755: '1.17',
-  754: '1.16.5',
-  753: '1.16.3',
-  751: '1.16.2',
-  736: '1.16.1',
-  578: '1.15.2',
-  575: '1.15.1',
-  573: '1.15',
-  498: '1.14.4',
-  490: '1.14.3',
-  485: '1.14.2',
-  480: '1.14.1',
-  477: '1.14',
-  404: '1.13.2',
-  401: '1.13.1',
-  393: '1.13',
-  340: '1.12.2',
-  338: '1.12.1',
-  335: '1.12',
-  315: '1.11',
-  110: '1.9.4',
+  769: '1.21.4', 768: '1.21.2', 767: '1.21', 766: '1.20.6', 765: '1.20.4',
+  764: '1.20.2', 763: '1.20.1', 762: '1.19.4', 761: '1.19.3', 760: '1.19.2',
+  759: '1.19',   758: '1.18.2', 757: '1.18.1', 756: '1.17.1', 755: '1.17',
+  754: '1.16.5', 753: '1.16.3', 751: '1.16.2', 736: '1.16.1', 578: '1.15.2',
+  575: '1.15.1', 573: '1.15',   498: '1.14.4', 490: '1.14.3', 485: '1.14.2',
+  480: '1.14.1', 477: '1.14',   404: '1.13.2', 401: '1.13.1', 393: '1.13',
+  340: '1.12.2', 338: '1.12.1', 335: '1.12',   315: '1.11',   110: '1.9.4',
   47:  '1.8.9'
 };
 
@@ -476,37 +502,46 @@ async function probeServer() {
     lastPing = result.online
       ? { ...result, checkedAt: new Date().toISOString() }
       : { ...lastPing, online: false, checkedAt: new Date().toISOString() };
-    log(`Probe result: ${result.online ? 'ONLINE' : 'OFFLINE'} (${config.host}:${config.port})${result.online ? ` ver=${result.version} protocol=${result.protocol}` : ''}`, result.online ? 'info' : 'warn');
     return result.online;
   } catch (e) {
-    log(`probeServer error — ${e.message}`, 'error');
     return false;
   }
 }
 
-// ── Auto-join scheduler (per bot instance) ───────────────────────────────────
+// ── Auto-join scheduler (per bot instance, with gradual backoff) ─────────────
+//
+// Retries forever while autoJoin is on and the bot hasn't been manually
+// stopped — this is what makes a long server outage (full restart, crash,
+// maintenance) resolve itself once the server comes back, with no manual
+// intervention needed. Backoff grows 15s → ~22s → ~34s → ... capped at 60s the
+// longer the outage lasts, then resets to 15s the moment the bot logs back in.
+
+const AUTO_JOIN_MIN_DELAY = 15000;
+const AUTO_JOIN_MAX_DELAY = 60000;
 
 function clearAutoJoinTimer(id) {
   const st = ensureState(id);
   if (st.autoJoinTimer) { clearTimeout(st.autoJoinTimer); st.autoJoinTimer = null; }
 }
 
-function scheduleAutoJoin(id, delayMs = 15000) {
+function scheduleAutoJoin(id, delayMs = AUTO_JOIN_MIN_DELAY) {
   clearAutoJoinTimer(id);
   const st = ensureState(id);
   if (!autoJoin || st.manualStop) return;
   const label = findProfile(id)?.name || id;
-  log(`Auto-join: next probe in ${delayMs / 1000}s…`, 'warn', label);
+  log(`Auto-join: next probe in ${Math.round(delayMs / 1000)}s…`, 'warn', label);
   st.autoJoinTimer = setTimeout(async () => {
     if (!autoJoin || st.manualStop) return;
-    if (st.bot) { log('Auto-join: bot already exists — skipping', 'info', label); return; }
+    if (st.bot) return;
     const online = await probeServer();
     if (online) {
       log('Auto-join: server online — connecting…', 'success', label);
       createBotInstance(id);
     } else {
-      log('Auto-join: server offline — retrying in 15s…', 'warn', label);
-      scheduleAutoJoin(id, 15000);
+      st.failCount = (st.failCount || 0) + 1;
+      const nextDelay = Math.min(AUTO_JOIN_MIN_DELAY * Math.pow(1.5, st.failCount), AUTO_JOIN_MAX_DELAY);
+      log(`Auto-join: server offline — retrying in ${Math.round(nextDelay / 1000)}s… (attempt ${st.failCount})`, 'warn', label);
+      scheduleAutoJoin(id, nextDelay);
     }
   }, delayMs);
 }
@@ -540,7 +575,6 @@ function parseServerChat(json) {
     if (!chatText) return null;
     return { rank, username, chatText };
   } catch (e) {
-    log(`[PARSE ERROR] ${e.message}`, 'warn');
     return null;
   }
 }
@@ -549,33 +583,21 @@ function parseServerChat(json) {
 
 async function resolveVersion() {
   if (config.version && config.version !== 'auto') {
-    log(`Using pinned version: ${config.version}`, 'info');
     return config.version;
   }
 
-  log('Version set to auto — pinging server to detect…', 'info');
   const ping = await pingServer(config.host, config.port);
 
   if (!ping.online) {
-    log('Auto-detect ping failed — falling back to 1.20.4', 'warn');
     return '1.20.4';
   }
 
-  log(`Server reports: version="${ping.version}" protocol=${ping.protocol}`, 'info');
-
   const mapped = protocolToVersion(ping.protocol);
-  if (mapped) {
-    log(`Auto-detected version: ${mapped} (protocol ${ping.protocol})`, 'success');
-    return mapped;
-  }
+  if (mapped) return mapped;
 
-  const match = ping.version.match(/1\.\d+(?:\.\d+)?/);
-  if (match) {
-    log(`Auto-detected version from string: ${match[0]}`, 'success');
-    return match[0];
-  }
+  const match = ping.version?.match(/1\.\d+(?:\.\d+)?/);
+  if (match) return match[0];
 
-  log(`Could not map protocol ${ping.protocol} — falling back to false (mineflayer auto)`, 'warn');
   return false;
 }
 
@@ -588,6 +610,7 @@ function createBotInstance(id) {
 
   const st = ensureState(id);
   st.manualStop = false;
+  saveState();
 
   if (st.bot) { log('createBot called but bot instance already exists — skipping', 'warn', profile.name); return; }
 
@@ -602,10 +625,13 @@ function createBotInstance(id) {
   preCheck.once('connect', () => {
     preCheckDone = true;
     preCheck.destroy();
-    log(`Pre-flight TCP OK — port ${config.port} reachable`, 'info', profile.name);
-    resolveVersion().then(ver => _spawnBotInstance(id, ver)).catch(e => {
+    if (st.manualStop) { st.status = 'disconnected'; return; } // Stop was pressed mid-connect
+    resolveVersion().then(ver => {
+      if (st.manualStop) { st.status = 'disconnected'; return; }
+      _spawnBotInstance(id, ver);
+    }).catch(e => {
       log(`resolveVersion error — ${e.message}`, 'error', profile.name);
-      _spawnBotInstance(id, false);
+      if (!st.manualStop) _spawnBotInstance(id, false);
     });
   });
 
@@ -615,7 +641,7 @@ function createBotInstance(id) {
     preCheck.destroy();
     log(`Pre-flight TCP TIMEOUT — ${config.host}:${config.port} unreachable`, 'error', profile.name);
     st.status = 'disconnected';
-    if (autoJoin && !st.manualStop) scheduleAutoJoin(id, 15000);
+    if (autoJoin && !st.manualStop) scheduleAutoJoin(id);
   });
 
   preCheck.once('error', err => {
@@ -624,7 +650,7 @@ function createBotInstance(id) {
     preCheck.destroy();
     log(`Pre-flight TCP ERROR — ${err.code || err.message}`, 'error', profile.name);
     st.status = 'disconnected';
-    if (autoJoin && !st.manualStop) scheduleAutoJoin(id, 15000);
+    if (autoJoin && !st.manualStop) scheduleAutoJoin(id);
   });
 
   preCheck.connect(Number(config.port), config.host);
@@ -633,6 +659,7 @@ function createBotInstance(id) {
 function _spawnBotInstance(id, resolvedVersion) {
   const profile = findProfile(id);
   const st      = ensureState(id);
+  if (!profile) return; // bot was removed while resolving version
   const label   = profile.name;
 
   log(`Spawning mineflayer bot — host=${config.host} port=${config.port} user=${profile.username} resolvedVersion=${resolvedVersion}…`, 'info', label);
@@ -644,72 +671,43 @@ function _spawnBotInstance(id, resolvedVersion) {
     auth:           'offline',
     connectTimeout: 30000,
     keepAlive:      true,
-    hideErrors:     false
+    hideErrors:     true
   };
 
   if (resolvedVersion) {
     botOptions.version = resolvedVersion;
   }
 
-  const bot = mineflayer.createBot(botOptions);
+  let bot;
+  try {
+    bot = mineflayer.createBot(botOptions);
+  } catch (e) {
+    log(`[SPAWN ERROR] ${e.message}`, 'error', label);
+    st.status = 'disconnected';
+    if (autoJoin && !st.manualStop) scheduleAutoJoin(id);
+    return;
+  }
+
   st.bot         = bot;
   st.packetCount = 0;
 
+  // Defensive: guarantee an 'error' listener exists on the raw socket so a
+  // stray socket error can never bubble up as an uncaught exception and
+  // crash the whole process.
   setImmediate(() => {
-    if (!st.bot || !st.bot._client) {
-      log('[DEBUG] bot._client not available after setImmediate', 'error', label);
-      return;
-    }
-
+    if (!st.bot || !st.bot._client) return;
     const client    = st.bot._client;
     const rawSocket = client.socket ?? client.stream ?? null;
-
-    if (rawSocket) {
-      rawSocket.on('close', hadError => {
-        log(`[SOCKET] TCP closed — hadError=${hadError}`, hadError ? 'error' : 'warn', label);
-      });
-      rawSocket.on('error', err => {
-        log(`[SOCKET] TCP error — ${err.code || err.message}`, 'error', label);
-      });
-    } else {
-      log('[DEBUG] No raw socket found on bot._client', 'warn', label);
+    if (rawSocket && typeof rawSocket.on === 'function') {
+      rawSocket.on('error', () => { /* handled via bot 'error'/'end' events below */ });
     }
-
-    client.on('packet', (data, meta) => {
-      st.packetCount++;
-      if (st.packetCount <= 30) {
-        const dataStr = JSON.stringify(data);
-        const preview = dataStr.length > 300 ? dataStr.slice(0, 300) + '…' : dataStr;
-        log(`[PKT #${st.packetCount}] state=${client.state} name=${meta.name} data=${preview}`, 'info', label);
-      }
-    });
-
-    client.on('state', (newState, oldState) => {
-      log(`[STATE] ${oldState} → ${newState}`, 'info', label);
-    });
-
-    client.on('disconnect', packet => {
-      let reason = '';
-      try {
-        const r = packet?.reason;
-        reason = typeof r === 'string' ? collectText(JSON.parse(r)) : collectText(r);
-      } catch { reason = String(packet?.reason ?? '(no reason)'); }
-      log(`[LOGIN DISCONNECT] "${reason}"`, 'error', label);
-    });
-
-    client.on('kick_disconnect', packet => {
-      let reason = '';
-      try {
-        const r = packet?.reason;
-        reason = typeof r === 'string' ? collectText(JSON.parse(r)) : collectText(r);
-      } catch { reason = String(packet?.reason ?? '(no reason)'); }
-      log(`[PLAY KICK] "${reason}"`, 'error', label);
-    });
   });
 
   bot.once('login', () => {
-    st.status = 'connected';
+    st.status    = 'connected';
+    st.failCount = 0;
     clearAutoJoinTimer(id);
+    saveState();
     log(`✓ Logged in as ${bot.username} | server version: ${bot.version}`, 'success', label);
   });
 
@@ -718,40 +716,40 @@ function _spawnBotInstance(id, resolvedVersion) {
   });
 
   bot.on('resourcePack', (url, hash, forced) => {
-    log(`[RESOURCE PACK] forced=${forced} — accepting`, 'info', label);
     bot.acceptResourcePack();
   });
 
   bot.on('playerJoined', player => {
     if (player.username === bot.username || isFakePlayer(player.username)) return;
     log(`[JOIN] ${player.username}`, 'success', label);
-    if (id === primaryId) sendJoinLeave(player.username, true);
+    if (id === relayId) sendJoinLeave(player.username, true);
   });
 
   bot.on('playerLeft', player => {
     if (player.username === bot.username || isFakePlayer(player.username)) return;
     log(`[LEAVE] ${player.username}`, 'warn', label);
-    if (id === primaryId) sendJoinLeave(player.username, false);
+    if (id === relayId) sendJoinLeave(player.username, false);
   });
 
   bot.on('message', (message, position) => {
     if (!['system', 'chat'].includes(position)) return;
+
     const plain = message.toString().trim();
     if (!plain) return;
-    if (id !== primaryId) return; // only the relay bot forwards chat/webhook events
 
     const json   = message.json ?? message.unsigned?.json ?? null;
     const parsed = parseServerChat(json);
+
     if (parsed) {
       const { rank, username, chatText } = parsed;
       log(`[CHAT] ${rank ? `[${rank}] ` : ''}${username}: ${chatText}`, 'success', label);
-      sendChatMessage(username, chatText, rank || null);
-      runAutomations(chatText, id);
+      if (id === relayId) sendChatMessage(username, chatText, rank || null);
+      runAutomations(chatText, id); // every connected bot checks its own automations
     } else {
       if (plain.endsWith('joined the game') || plain.endsWith('left the game')) return;
       log(`[SYS] ${plain}`, 'info', label);
-      sendSystemMessage(plain);
-      runAutomations(plain, id);
+      if (id === relayId) sendSystemMessage(plain);
+      runAutomations(plain, id); // e.g. a private "/login" prompt only this bot received
     }
   });
 
@@ -762,28 +760,23 @@ function _spawnBotInstance(id, resolvedVersion) {
     fired = true;
     st.status = 'disconnected';
     log(`[DISCONNECT] ${evLabel}: ${detail}`, type, label);
-    log(`[DISCONNECT] packets received: ${st.packetCount} | state: ${st.bot?._client?.state ?? 'unknown'}`, 'info', label);
     st.bot = null;
     if (autoJoin && !st.manualStop) {
-      log('Auto-join: retrying in 10s…', 'warn', label);
-      scheduleAutoJoin(id, 10000);
+      scheduleAutoJoin(id, AUTO_JOIN_MIN_DELAY);
     }
   };
 
   bot.once('kicked', r => {
     const reason = typeof r === 'string' ? r : JSON.stringify(r);
-    log(`[KICKED RAW] ${reason}`, 'error', label);
     onDisconnect('Kicked', reason, 'error');
   });
 
   bot.once('error', err => {
-    log(`[ERROR RAW] code=${err.code} msg=${err.message}`, 'error', label);
-    onDisconnect('Error', err.message, 'error');
+    onDisconnect('Error', err?.message || String(err), 'error');
   });
 
   bot.once('end', reason => {
     const detail = reason ? `reason=${reason}` : 'connection closed (no reason given)';
-    log(`[END RAW] ${detail}`, 'warn', label);
     onDisconnect('Disconnected', detail);
   });
 }
@@ -792,18 +785,23 @@ function destroyBotInstance(id) {
   const st      = ensureState(id);
   const profile = findProfile(id);
   st.manualStop = true;
+  st.failCount  = 0;
   clearAutoJoinTimer(id);
   if (st.bot) { try { st.bot.quit('Stopping relay bot'); } catch {} st.bot = null; }
   st.status = 'disconnected';
+  saveState();
   log('Bot stopped', 'info', profile?.name);
 }
 
-// ── Bot profile management (create/remove/select relay bot) ──────────────────
+// ── Bot profile management (create/remove/select roles) ──────────────────────
 
 function listBots() {
   return profiles.map(p => {
     const st = ensureState(p.id);
-    return { id: p.id, name: p.name, username: p.username, status: st.status, isPrimary: p.id === primaryId };
+    return {
+      id: p.id, name: p.name, username: p.username, status: st.status,
+      isRelay: p.id === relayId, isSpeaker: p.id === speakerId
+    };
   });
 }
 
@@ -820,7 +818,9 @@ function addBot(name, username) {
   const profile = { id, name, username };
   profiles.push(profile);
   ensureState(id);
-  if (!primaryId) primaryId = id;
+  if (!relayId)   relayId   = id;
+  if (!speakerId) speakerId = id;
+  saveState();
   log(`Bot profile created: ${name} (${username})`);
   return profile;
 }
@@ -833,21 +833,31 @@ function removeBot(id) {
   instances.delete(id);
   const [removed] = profiles.splice(idx, 1);
 
-  if (primaryId === id) {
-    primaryId = profiles.length ? profiles[0].id : null;
-    if (primaryId) log(`Relay bot reassigned to: ${findProfile(primaryId).name}`);
-  }
+  if (relayId === id)   relayId   = profiles[0]?.id ?? null;
+  if (speakerId === id) speakerId = profiles[0]?.id ?? null;
+
+  saveState();
   log(`Bot profile removed: ${removed.name}`);
 }
 
-function setPrimary(id) {
+function setRelay(id) {
   const profile = findProfile(id);
   if (!profile) throw new Error('Bot not found');
-  primaryId = id;
-  log(`Relay bot set to: ${profile.name}`);
+  relayId = id;
+  saveState();
+  log(`Relay bot (MC → Discord) set to: ${profile.name}`);
 }
 
-function getPrimaryId() { return primaryId; }
+function setSpeaker(id) {
+  const profile = findProfile(id);
+  if (!profile) throw new Error('Bot not found');
+  speakerId = id;
+  saveState();
+  log(`Speaker bot (Discord → MC) set to: ${profile.name}`);
+}
+
+function getRelayId()   { return relayId; }
+function getSpeakerId() { return speakerId; }
 
 function getOverallStatus() {
   let anyConnected = false, anyConnecting = false;
@@ -862,11 +872,13 @@ function getOverallStatus() {
 
 // ── Chat API ──────────────────────────────────────────────────────────────────
 
-function pickSenderBot() {
-  if (primaryId) {
-    const st = instances.get(primaryId);
+function pickSpeakerBot() {
+  if (speakerId) {
+    const st = instances.get(speakerId);
     if (st && st.status === 'connected' && st.bot) return st.bot;
   }
+  // Fallback: any connected bot, so dashboard chat still works if the
+  // designated speaker happens to be offline.
   for (const st of instances.values()) {
     if (st.status === 'connected' && st.bot) return st.bot;
   }
@@ -874,7 +886,7 @@ function pickSenderBot() {
 }
 
 function sendChat(message) {
-  const bot = pickSenderBot();
+  const bot = pickSpeakerBot();
   if (!bot) { log('No connected bot available to send chat', 'error'); return false; }
   bot.chat(message);
   log(`[SENT] ${message}`, 'success');
@@ -882,7 +894,7 @@ function sendChat(message) {
 }
 
 function sendDiscordChat(discordKey, text) {
-  const bot = pickSenderBot();
+  const bot = pickSpeakerBot();
   if (!bot) return false;
   const safe = text.replace(/^[\\/\\.]+/, '').trim();
   if (!safe) return false;
@@ -914,16 +926,40 @@ function setAutoJoin(enabled) {
   if (!autoJoin) {
     for (const id of instances.keys()) clearAutoJoinTimer(id);
   }
+  saveState();
   log(`Auto-join ${autoJoin ? 'enabled' : 'disabled'}`);
 }
 
-function setBlockedPhrases(phrases)  { blockedPhrases = Array.isArray(phrases) ? phrases : []; }
-function setNameAliases(aliases)     { nameAliases    = (aliases && typeof aliases === 'object') ? aliases : {}; }
-function setUseDisplayName(val)      { useDisplayName = !!val; log(`Name key: ${useDisplayName ? 'display name' : 'username'}`); }
+function setBlockedPhrases(phrases)  { blockedPhrases = Array.isArray(phrases) ? phrases : []; saveState(); }
+function setNameAliases(aliases)     { nameAliases    = (aliases && typeof aliases === 'object') ? aliases : {}; saveState(); }
+function setUseDisplayName(val)      { useDisplayName = !!val; saveState(); log(`Name key: ${useDisplayName ? 'display name' : 'username'}`); }
 function setAutomations(rules) {
   automations = Array.isArray(rules) ? rules.filter(r => r.trigger && r.response) : [];
+  saveState();
   log(`Automations updated: ${automations.length} rule(s)`);
 }
+
+function setServerConfig({ host, port, webhookUrl, version }) {
+  if (host !== undefined)       config.host       = host.trim();
+  if (port !== undefined)       config.port       = Number(port) || 25565;
+  if (webhookUrl !== undefined) config.webhookUrl = webhookUrl || '';
+  if (version !== undefined)    config.version    = version || 'auto';
+  saveState();
+}
+
+// ── Boot: resume bots that were connected before the last restart ────────────
+
+function resumeConnections() {
+  const ids = Array.isArray(saved?.wantConnected) ? saved.wantConnected : [];
+  if (!ids.length) return;
+  log(`Resuming ${ids.length} bot(s) that were connected before restart…`);
+  for (const id of ids) {
+    if (findProfile(id)) createBotInstance(id);
+  }
+}
+// Small delay to let the process fully settle (env vars, listeners, etc.)
+// before hitting the network.
+setTimeout(resumeConnections, 3000);
 
 // ── Exports ───────────────────────────────────────────────────────────────────
 
@@ -932,7 +968,8 @@ module.exports = {
   MAX_BOTS,
 
   // profiles
-  listBots, addBot, removeBot, setPrimary, getPrimaryId,
+  listBots, addBot, removeBot,
+  setRelay, setSpeaker, getRelayId, getSpeakerId,
 
   // lifecycle
   connectBot: createBotInstance,
@@ -942,6 +979,7 @@ module.exports = {
   getOverallStatus,
   pingServer,
   getLastPing,
+  setServerConfig,
 
   // chat
   sendChat, sendDiscordChat, getOnlinePlayers,
