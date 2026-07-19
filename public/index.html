@@ -577,7 +577,7 @@ select option { background: #111; }
 
 <script>
 // ── State ─────────────────────────────────────────────────────────────────────
-let lastLogCount   = 0;
+let lastLogCount   = '';
 let blockedPhrases = [];
 let nameAliases    = {};
 let automations    = [];
@@ -820,8 +820,14 @@ function isSysMsg(msg) {
 async function fetchLogs() {
   try {
     const d = await api('/api/logs');
-    if (d.logs.length === lastLogCount) return;
-    lastLogCount = d.logs.length;
+    // Logs are capped at 200 entries server-side (oldest popped as newest are
+    // unshifted in), so length alone stops changing once the cap is hit and a
+    // pure length comparison would freeze the panel forever. Fingerprint the
+    // newest entry instead so we still detect new logs after the cap.
+    const newest    = d.logs[0];
+    const signature = d.logs.length + '|' + (newest ? newest.time + newest.msg : '');
+    if (signature === lastLogCount) return;
+    lastLogCount = signature;
 
     const area = document.getElementById('log-area');
     document.getElementById('empty-hint')?.remove();
@@ -850,7 +856,7 @@ async function fetchLogs() {
 // ── Clear logs ────────────────────────────────────────────────────────────────
 async function clearLogs() {
   await api('/api/logs/clear', {});
-  lastLogCount = 0;
+  lastLogCount = '';
   const area = document.getElementById('log-area');
   area.innerHTML = '<div class="empty-log">// Logs cleared</div>';
   showToast('Logs cleared');
