@@ -324,6 +324,10 @@ function attemptLogin() {
         err.code === 'TOKEN_INVALID'
       ) {
         console.error('[DISCORD] ❌ Token is invalid — please regenerate your bot token at discord.com/developers');
+        // Don't leave wasRunning=true — otherwise every future restart will
+        // retry this same dead token on boot before giving up again.
+        dcState.wasRunning = false;
+        saveDiscordState();
         return;
       }
 
