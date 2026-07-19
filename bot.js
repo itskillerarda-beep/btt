@@ -95,7 +95,7 @@ function ensureState(id) {
   if (!instances.has(id)) {
     instances.set(id, {
       bot: null, status: 'disconnected', manualStop: true,
-      autoJoinTimer: null, packetCount: 0, failCount: 0
+      autoJoinTimer: null, packetCount: 0, failCount: 0, connectWatchdog: null
     });
   }
   return instances.get(id);
@@ -691,6 +691,23 @@ function _spawnBotInstance(id, resolvedVersion) {
   st.bot         = bot;
   st.packetCount = 0;
 
+  // Watchdog: connectTimeout only bounds the raw TCP dial, not the
+  // login → play handshake. If a server accepts the socket but hangs
+  // mid-login (very common right as a server restarts), mineflayer will
+  // never emit 'kicked'/'error'/'end', st.bot stays non-null forever, and
+  // the auto-join scheduler's `if (st.bot) return` check permanently blocks
+  // every future retry. Force a reconnect if login hasn't completed in time.
+  const CONNECT_WATCHDOG_MS = 45000;
+  st.connectWatchdog = setTimeout(() => {
+    st.connectWatchdog = null;
+    if (st.status !== 'connecting' || st.bot !== bot) return; // already resolved
+    log(`Login handshake stuck for ${CONNECT_WATCHDOG_MS / 1000}s — forcing reconnect`, 'error', label);
+    try { bot.end('Watchdog: stuck connecting'); } catch (e) {}
+    st.bot    = null;
+    st.status = 'disconnected';
+    if (autoJoin && !st.manualStop) scheduleAutoJoin(id, AUTO_JOIN_MIN_DELAY);
+  }, CONNECT_WATCHDOG_MS);
+
   // Defensive: guarantee an 'error' listener exists on the raw socket so a
   // stray socket error can never bubble up as an uncaught exception and
   // crash the whole process.
@@ -704,6 +721,7 @@ function _spawnBotInstance(id, resolvedVersion) {
   });
 
   bot.once('login', () => {
+    if (st.connectWatchdog) { clearTimeout(st.connectWatchdog); st.connectWatchdog = null; }
     st.status    = 'connected';
     st.failCount = 0;
     clearAutoJoinTimer(id);
@@ -758,6 +776,7 @@ function _spawnBotInstance(id, resolvedVersion) {
   const onDisconnect = (evLabel, detail, type = 'warn') => {
     if (fired) return;
     fired = true;
+    if (st.connectWatchdog) { clearTimeout(st.connectWatchdog); st.connectWatchdog = null; }
     st.status = 'disconnected';
     log(`[DISCONNECT] ${evLabel}: ${detail}`, type, label);
     st.bot = null;
@@ -787,6 +806,7 @@ function destroyBotInstance(id) {
   st.manualStop = true;
   st.failCount  = 0;
   clearAutoJoinTimer(id);
+  if (st.connectWatchdog) { clearTimeout(st.connectWatchdog); st.connectWatchdog = null; }
   if (st.bot) { try { st.bot.quit('Stopping relay bot'); } catch {} st.bot = null; }
   st.status = 'disconnected';
   saveState();
